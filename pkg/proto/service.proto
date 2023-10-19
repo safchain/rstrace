@@ -1,13 +1,21 @@
 syntax = "proto3";
 
-package rstrace;
+package proto;
 
-option go_package = "./pkg/rstrace";
+option go_package = "./pkg/proto";
+
+enum SyscallType {
+    Unknown = 0;
+    Exec = 1;
+	Fork = 2;
+	Open = 3;
+}
 
 message ContainerContext {
     string ID = 1;
     string Name = 2;
     string Tag = 3;
+    uint64 CreatedAt = 4;
 }
 
 message ExecSyscallMsg {
@@ -27,7 +35,7 @@ message OpenSyscallMsg {
 }
 
 message SyscallMsg {
-    uint32 Type = 1;
+    SyscallType Type = 1;
     uint32 PID = 2;
     ExecSyscallMsg Exec = 3;
     OpenSyscallMsg Open = 4;

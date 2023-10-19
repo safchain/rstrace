@@ -2,9 +2,9 @@
 // versions:
 // - protoc-gen-go-grpc v1.3.0
 // - protoc             v3.6.1
-// source: pkg/rstrace/service.proto
+// source: pkg/proto/service.proto
 
-package rstrace
+package proto
 
 import (
 	context "context"
@@ -19,7 +19,7 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	SyscallMsgStream_SendSyscallMsg_FullMethodName = "/rstrace.SyscallMsgStream/SendSyscallMsg"
+	SyscallMsgStream_SendSyscallMsg_FullMethodName = "/proto.SyscallMsgStream/SendSyscallMsg"
 )
 
 // SyscallMsgStreamClient is the client API for SyscallMsgStream service.
@@ -96,7 +96,7 @@ func _SyscallMsgStream_SendSyscallMsg_Handler(srv interface{}, ctx context.Conte
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var SyscallMsgStream_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "rstrace.SyscallMsgStream",
+	ServiceName: "proto.SyscallMsgStream",
 	HandlerType: (*SyscallMsgStreamServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
@@ -105,5 +105,5 @@ var SyscallMsgStream_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "pkg/rstrace/service.proto",
+	Metadata: "pkg/proto/service.proto",
 }
