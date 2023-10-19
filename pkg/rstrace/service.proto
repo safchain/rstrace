@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package rstrace;
+
+option go_package = "./pkg/rstrace";
+
+message ContainerContext {
+    string ID = 1;
+    string Name = 2;
+    string Tag = 3;
+}
+
+message ExecSyscallMsg {
+    string Filename = 1;
+    repeated string Args = 2;
+    repeated string Envs = 3;
+}
+
+message ForkSyscallMsg {
+    uint32 PPID = 1;
+}
+
+message OpenSyscallMsg {
+    string Filename = 1;
+    uint32 Flags = 2;
+    uint32 Mode = 3;
+}
+
+message SyscallMsg {
+    uint32 Type = 1;
+    uint32 PID = 2;
+    ExecSyscallMsg Exec = 3;
+    OpenSyscallMsg Open = 4;
+    ForkSyscallMsg Fork = 5;
+    ContainerContext ContainerContext = 6;
+}
+
+message Response {}
+
+service SyscallMsgStream {
+	rpc SendSyscallMsg (SyscallMsg) returns (Response) {}
+}
