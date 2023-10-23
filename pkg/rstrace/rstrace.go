@@ -2,6 +2,8 @@ package rstrace
 
 import (
 	"encoding/binary"
+	"os"
+	"os/exec"
 	"runtime"
 	"syscall"
 
@@ -46,7 +48,7 @@ func (t *Tracer) ReadRet(regs syscall.PtraceRegs) uint64 {
 	return regs.Rax
 }
 
-func (t *Tracer) readString(ptr uint64) (string, error) {
+func (t *Tracer) readString(pid int, ptr uint64) (string, error) {
 	var (
 		result []byte
 		data   = make([]byte, 1)
@@ -55,7 +57,7 @@ func (t *Tracer) readString(ptr uint64) (string, error) {
 
 	// TODO : process_vm_readv
 	for {
-		n, err := syscall.PtracePeekData(t.PID, uintptr(ptr+i), data)
+		n, err := syscall.PtracePeekData(pid, uintptr(ptr+i), data)
 		if err != nil || n != len(data) {
 			return "", err
 		}
@@ -75,9 +77,9 @@ func (t *Tracer) ReadArgUint64(regs syscall.PtraceRegs, arg int) uint64 {
 	return t.argToRegValue(regs, arg)
 }
 
-func (t *Tracer) ReadArgString(regs syscall.PtraceRegs, arg int) (string, error) {
+func (t *Tracer) ReadArgString(pid int, regs syscall.PtraceRegs, arg int) (string, error) {
 	ptr := t.argToRegValue(regs, arg)
-	return t.readString(ptr)
+	return t.readString(pid, ptr)
 }
 
 func (t *Tracer) GetSyscallName(regs syscall.PtraceRegs) string {
@@ -85,7 +87,7 @@ func (t *Tracer) GetSyscallName(regs syscall.PtraceRegs) string {
 	return name
 }
 
-func (t *Tracer) ReadArgStringArray(regs syscall.PtraceRegs, arg int) ([]string, error) {
+func (t *Tracer) ReadArgStringArray(pid int, regs syscall.PtraceRegs, arg int) ([]string, error) {
 	ptr := t.argToRegValue(regs, arg)
 
 	var (
@@ -96,7 +98,7 @@ func (t *Tracer) ReadArgStringArray(regs syscall.PtraceRegs, arg int) ([]string,
 
 	// TODO : process_vm_readv
 	for {
-		n, err := syscall.PtracePeekData(t.PID, uintptr(ptr+i), data)
+		n, err := syscall.PtracePeekData(pid, uintptr(ptr+i), data)
 		if err != nil || n != len(data) {
 			return result, err
 		}
@@ -106,7 +108,7 @@ func (t *Tracer) ReadArgStringArray(regs syscall.PtraceRegs, arg int) ([]string,
 			break
 		}
 
-		str, err := t.readString(ptr)
+		str, err := t.readString(pid, ptr)
 		if err != nil {
 			break
 		}
@@ -118,9 +120,7 @@ func (t *Tracer) ReadArgStringArray(regs syscall.PtraceRegs, arg int) ([]string,
 	return result, nil
 }
 
-func (t *Tracer) Trace(cb func(pid uint32, ppid uint32, regs syscall.PtraceRegs)) error {
-	runtime.LockOSThread()
-
+func (t *Tracer) Trace(cb func(pid int, ppid uint32, regs syscall.PtraceRegs)) error {
 	var waitStatus syscall.WaitStatus
 
 	if err := syscall.PtraceSyscall(t.PID, 0); err != nil {
@@ -150,7 +150,7 @@ func (t *Tracer) Trace(cb func(pid uint32, ppid uint32, regs syscall.PtraceRegs)
 			switch waitEvent(waitStatus) {
 			case EventFork, EventVFork, EventClone:
 				if npid, err := syscall.PtraceGetEventMsg(pid); err == nil {
-					cb(uint32(npid), uint32(pid), regs)
+					cb(int(npid), uint32(pid), regs)
 				}
 			default:
 				if -regs.Rax == uint64(syscall.ENOSYS) {
@@ -159,7 +159,7 @@ func (t *Tracer) Trace(cb func(pid uint32, ppid uint32, regs syscall.PtraceRegs)
 					switch name {
 					case "fork", "vfork", "clone":
 					default:
-						cb(uint32(pid), 0, regs)
+						cb(pid, 0, regs)
 					}
 				} else {
 					// exit of syscall
@@ -175,16 +175,32 @@ func (t *Tracer) Trace(cb func(pid uint32, ppid uint32, regs syscall.PtraceRegs)
 	return nil
 }
 
-func NewTracer(pid int) *Tracer {
+func NewTracer(name string, args ...string) *Tracer {
+	runtime.LockOSThread()
+
+	// INIT
+	cmd := exec.Command(os.Args[1], os.Args[2:]...)
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Ptrace: true,
+	}
+
+	if err := cmd.Start(); err != nil {
+		panic(err)
+	}
+	cmd.Wait()
+
 	const flags = syscall.PTRACE_O_TRACEVFORK |
 		syscall.PTRACE_O_TRACEFORK |
 		syscall.PTRACE_O_TRACECLONE |
 		syscall.PTRACE_O_TRACEEXEC |
 		syscall.PTRACE_O_TRACESYSGOOD
 
-	syscall.PtraceSetOptions(pid, flags)
+	syscall.PtraceSetOptions(cmd.Process.Pid, flags)
 
 	return &Tracer{
-		PID: pid,
+		PID: cmd.Process.Pid,
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"syscall"
 	"time"
 
@@ -15,7 +14,7 @@ import (
 )
 
 func main() {
-	fmt.Printf("Run %v\n", os.Args[1:])
+	fmt.Printf("Run %v [%s]\n", os.Args[1:], os.Getenv("DD_CONTAINER_ID"))
 
 	// GRPC
 	conn, err := grpc.Dial("localhost:7878", grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -26,22 +25,6 @@ func main() {
 
 	client := proto.NewSyscallMsgStreamClient(conn)
 
-	// INIT
-	cmd := exec.Command(os.Args[1], os.Args[2:]...)
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Ptrace: true,
-	}
-
-	if err := cmd.Start(); err != nil {
-		panic(err)
-	}
-	cmd.Wait()
-
-	ctx := context.Background()
-
 	containerCtx := proto.ContainerContext{
 		ID:        os.Getenv("DD_CONTAINER_ID"),
 		Name:      os.Getenv("DD_CONTAINER_NAME"),
@@ -49,16 +32,19 @@ func main() {
 		CreatedAt: uint64(time.Now().UnixNano()),
 	}
 
-	tracer := rstrace.NewTracer(cmd.Process.Pid)
+	ctx := context.Background()
+
+	tracer := rstrace.NewTracer(os.Args[1], os.Args[2:]...)
 
 	ch := make(chan proto.SyscallMsg, 10000)
+
 	go func() {
 		msg := proto.SyscallMsg{
 			ContainerContext: &containerCtx,
 		}
 
 		msg.Type = proto.SyscallType_Exec
-		msg.PID = uint32(cmd.Process.Pid)
+		msg.PID = uint32(tracer.PID)
 		msg.Exec = &proto.ExecSyscallMsg{
 			Filename: os.Args[1],
 			Args:     os.Args[1:],
@@ -73,12 +59,11 @@ func main() {
 		}
 
 		for msg := range ch {
-			fmt.Printf("SEND : %+v\n", msg)
 			client.SendSyscallMsg(ctx, &msg)
 		}
 	}()
 
-	cb := func(pid uint32, ppid uint32, regs syscall.PtraceRegs) {
+	cb := func(pid int, ppid uint32, regs syscall.PtraceRegs) {
 		msg := proto.SyscallMsg{
 			ContainerContext: &containerCtx,
 		}
@@ -87,13 +72,24 @@ func main() {
 
 		switch name {
 		case "open":
-			fmt.Printf("OPEN\n")
-		case "openat2":
-			fmt.Printf("OPEN2\n")
-		case "openat":
-			filename, _ := tracer.ReadArgString(regs, 1)
+			filename, err := tracer.ReadArgString(pid, regs, 0)
+			if err != nil {
+				return
+			}
 			msg.Type = proto.SyscallType_Open
-			msg.PID = pid
+			msg.PID = uint32(pid)
+			msg.Open = &proto.OpenSyscallMsg{
+				Filename: filename,
+				Flags:    uint32(tracer.ReadArgUint64(regs, 1)),
+				Mode:     uint32(tracer.ReadArgUint64(regs, 2)),
+			}
+		case "openat":
+			filename, err := tracer.ReadArgString(pid, regs, 1)
+			if err != nil {
+				return
+			}
+			msg.Type = proto.SyscallType_Open
+			msg.PID = uint32(pid)
 			msg.Open = &proto.OpenSyscallMsg{
 				Filename: filename,
 				Flags:    uint32(tracer.ReadArgUint64(regs, 2)),
@@ -101,17 +97,26 @@ func main() {
 			}
 		case "fork", "vfork", "clone":
 			msg.Type = proto.SyscallType_Fork
-			msg.PID = pid
+			msg.PID = uint32(pid)
 			msg.Fork = &proto.ForkSyscallMsg{
 				PPID: ppid,
 			}
 		case "execve":
-			filename, _ := tracer.ReadArgString(regs, 0)
-			args, _ := tracer.ReadArgStringArray(regs, 1)
-			envs, _ := tracer.ReadArgStringArray(regs, 2)
+			filename, err := tracer.ReadArgString(pid, regs, 0)
+			if err != nil {
+				return
+			}
+			args, err := tracer.ReadArgStringArray(pid, regs, 1)
+			if err != nil {
+				return
+			}
+			envs, err := tracer.ReadArgStringArray(pid, regs, 2)
+			if err != nil {
+				return
+			}
 
 			msg.Type = proto.SyscallType_Exec
-			msg.PID = pid
+			msg.PID = uint32(pid)
 			msg.Exec = &proto.ExecSyscallMsg{
 				Filename: filename,
 				Args:     args,
