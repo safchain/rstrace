@@ -7,7 +7,7 @@ import (
 	"runtime"
 	"syscall"
 
-	sec "github.com/seccomp/libseccomp-golang"
+	"github.com/elastic/go-seccomp-bpf/arch"
 )
 
 const (
@@ -18,6 +18,9 @@ const (
 
 type Tracer struct {
 	PID int
+
+	// internals
+	info *arch.Info
 }
 
 func waitEvent(status syscall.WaitStatus) uint32 {
@@ -83,8 +86,7 @@ func (t *Tracer) ReadArgString(pid int, regs syscall.PtraceRegs, arg int) (strin
 }
 
 func (t *Tracer) GetSyscallName(regs syscall.PtraceRegs) string {
-	name, _ := sec.ScmpSyscall(regs.Orig_rax).GetName()
-	return name
+	return t.info.SyscallNumbers[int(regs.Orig_rax)]
 }
 
 func (t *Tracer) ReadArgStringArray(pid int, regs syscall.PtraceRegs, arg int) ([]string, error) {
@@ -175,7 +177,12 @@ func (t *Tracer) Trace(cb func(pid int, ppid uint32, regs syscall.PtraceRegs)) e
 	return nil
 }
 
-func NewTracer(name string, args ...string) *Tracer {
+func NewTracer(name string, args ...string) (*Tracer, error) {
+	info, err := arch.GetInfo("")
+	if err != nil {
+		return nil, err
+	}
+
 	runtime.LockOSThread()
 
 	// INIT
@@ -188,7 +195,7 @@ func NewTracer(name string, args ...string) *Tracer {
 	}
 
 	if err := cmd.Start(); err != nil {
-		panic(err)
+		return nil, err
 	}
 	cmd.Wait()
 
@@ -201,6 +208,7 @@ func NewTracer(name string, args ...string) *Tracer {
 	syscall.PtraceSetOptions(cmd.Process.Pid, flags)
 
 	return &Tracer{
-		PID: cmd.Process.Pid,
-	}
+		PID:  cmd.Process.Pid,
+		info: info,
+	}, nil
 }

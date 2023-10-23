@@ -2,19 +2,22 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"syscall"
 	"time"
 
-	"github.com/safchain/rstrace/pkg/proto"
-	"github.com/safchain/rstrace/pkg/rstrace"
+	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/safchain/rstrace/pkg/proto"
+	"github.com/safchain/rstrace/pkg/rstrace"
 )
 
 func main() {
-	fmt.Printf("Run %v [%s]\n", os.Args[1:], os.Getenv("DD_CONTAINER_ID"))
+	log.SetLevel(log.DebugLevel)
+
+	log.Infof("Run %v [%s]\n", os.Args[1:], os.Getenv("DD_CONTAINER_ID"))
 
 	// GRPC
 	conn, err := grpc.Dial("localhost:7878", grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -34,7 +37,10 @@ func main() {
 
 	ctx := context.Background()
 
-	tracer := rstrace.NewTracer(os.Args[1], os.Args[2:]...)
+	tracer, err := rstrace.NewTracer(os.Args[1], os.Args[2:]...)
+	if err != nil {
+		panic(err)
+	}
 
 	ch := make(chan proto.SyscallMsg, 10000)
 
@@ -59,6 +65,7 @@ func main() {
 		}
 
 		for msg := range ch {
+			log.Debugf("send message: %+v", msg)
 			client.SendSyscallMsg(ctx, &msg)
 		}
 	}()

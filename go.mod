@@ -3,9 +3,11 @@ module github.com/safchain/rstrace
 go 1.20
 
 require (
+	github.com/elastic/go-seccomp-bpf v1.3.0 // indirect
 	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/jfrabaute/libtrace v0.0.0-20150126080012-40137c511095 // indirect
 	github.com/seccomp/libseccomp-golang v0.10.0 // indirect
+	github.com/sirupsen/logrus v1.9.3 // indirect
 	golang.org/x/net v0.12.0 // indirect
 	golang.org/x/sys v0.10.0 // indirect
 	golang.org/x/text v0.11.0 // indirect
