@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"syscall"
 
+	"github.com/elastic/go-seccomp-bpf"
 	"github.com/elastic/go-seccomp-bpf/arch"
 )
 
@@ -160,6 +161,7 @@ func (t *Tracer) Trace(cb func(pid int, ppid uint32, regs syscall.PtraceRegs)) e
 
 					switch name {
 					case "fork", "vfork", "clone":
+						// already handled
 					default:
 						cb(pid, 0, regs)
 					}
@@ -185,7 +187,33 @@ func NewTracer(name string, args ...string) (*Tracer, error) {
 
 	runtime.LockOSThread()
 
-	// INIT
+	filter := seccomp.Filter{
+		NoNewPrivs: true,
+		Flag:       seccomp.FilterFlagTSync,
+		Policy: seccomp.Policy{
+			DefaultAction: seccomp.ActionAllow,
+			Syscalls: []seccomp.SyscallGroup{
+				{
+					Action: seccomp.ActionTrace | seccomp.ActionAllow,
+					Names: []string{
+						//"open",
+						//"openat",
+						"fork",
+						"vfork",
+						"clone",
+						"execve",
+						"execveat",
+					},
+				},
+			},
+		},
+	}
+	//_ = filter
+
+	if err := seccomp.LoadFilter(filter); err != nil {
+		return nil, err
+	}
+
 	cmd := exec.Command(os.Args[1], os.Args[2:]...)
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin

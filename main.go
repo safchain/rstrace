@@ -14,6 +14,47 @@ import (
 	"github.com/safchain/rstrace/pkg/rstrace"
 )
 
+func handleOpen(tracer *rstrace.Tracer, msg *proto.SyscallMsg, pid int, regs syscall.PtraceRegs, firstReg int) error {
+	filename, err := tracer.ReadArgString(pid, regs, firstReg)
+	if err != nil {
+		return err
+	}
+	msg.Type = proto.SyscallType_Open
+	msg.PID = uint32(pid)
+	msg.Open = &proto.OpenSyscallMsg{
+		Filename: filename,
+		Flags:    uint32(tracer.ReadArgUint64(regs, firstReg+1)),
+		Mode:     uint32(tracer.ReadArgUint64(regs, firstReg+2)),
+	}
+
+	return nil
+}
+
+func handleExecve(tracer *rstrace.Tracer, msg *proto.SyscallMsg, pid int, regs syscall.PtraceRegs, firstReg int) error {
+	filename, err := tracer.ReadArgString(pid, regs, firstReg)
+	if err != nil {
+		return err
+	}
+	args, err := tracer.ReadArgStringArray(pid, regs, firstReg+1)
+	if err != nil {
+		return err
+	}
+	envs, err := tracer.ReadArgStringArray(pid, regs, firstReg+2)
+	if err != nil {
+		return err
+	}
+
+	msg.Type = proto.SyscallType_Exec
+	msg.PID = uint32(pid)
+	msg.Exec = &proto.ExecSyscallMsg{
+		Filename: filename,
+		Args:     args,
+		Envs:     envs,
+	}
+
+	return nil
+}
+
 func main() {
 	log.SetLevel(log.DebugLevel)
 
@@ -42,7 +83,8 @@ func main() {
 		panic(err)
 	}
 
-	ch := make(chan proto.SyscallMsg, 10000)
+	msgChan := make(chan proto.SyscallMsg, 10000)
+	traceChan := make(chan bool)
 
 	go func() {
 		msg := proto.SyscallMsg{
@@ -59,12 +101,22 @@ func main() {
 
 		_, err := client.SendSyscallMsg(ctx, &msg)
 		if err != nil {
+			var lastLog time.Time
 			for err != nil {
+				now := time.Now()
+				if time.Now().Sub(lastLog) > time.Second {
+					log.Errorf("waiting for the server: %+v", err)
+					lastLog = now
+				}
+
+				time.Sleep(100 * time.Millisecond)
 				_, err = client.SendSyscallMsg(ctx, &msg)
 			}
 		}
 
-		for msg := range ch {
+		traceChan <- true
+
+		for msg := range msgChan {
 			log.Debugf("send message: %+v", msg)
 			client.SendSyscallMsg(ctx, &msg)
 		}
@@ -79,28 +131,14 @@ func main() {
 
 		switch name {
 		case "open":
-			filename, err := tracer.ReadArgString(pid, regs, 0)
-			if err != nil {
+			if err := handleOpen(tracer, &msg, pid, regs, 0); err != nil {
+				log.Errorf("unable to handle open: %v", err)
 				return
-			}
-			msg.Type = proto.SyscallType_Open
-			msg.PID = uint32(pid)
-			msg.Open = &proto.OpenSyscallMsg{
-				Filename: filename,
-				Flags:    uint32(tracer.ReadArgUint64(regs, 1)),
-				Mode:     uint32(tracer.ReadArgUint64(regs, 2)),
 			}
 		case "openat":
-			filename, err := tracer.ReadArgString(pid, regs, 1)
-			if err != nil {
+			if err := handleOpen(tracer, &msg, pid, regs, 1); err != nil {
+				log.Errorf("unable to handle openat: %v", err)
 				return
-			}
-			msg.Type = proto.SyscallType_Open
-			msg.PID = uint32(pid)
-			msg.Open = &proto.OpenSyscallMsg{
-				Filename: filename,
-				Flags:    uint32(tracer.ReadArgUint64(regs, 2)),
-				Mode:     uint32(tracer.ReadArgUint64(regs, 3)),
 			}
 		case "fork", "vfork", "clone":
 			msg.Type = proto.SyscallType_Fork
@@ -109,32 +147,23 @@ func main() {
 				PPID: ppid,
 			}
 		case "execve":
-			filename, err := tracer.ReadArgString(pid, regs, 0)
-			if err != nil {
+			if err = handleExecve(tracer, &msg, pid, regs, 0); err != nil {
+				log.Errorf("unable to handle execve: %v", err)
 				return
 			}
-			args, err := tracer.ReadArgStringArray(pid, regs, 1)
-			if err != nil {
+		case "execveat":
+			if err = handleExecve(tracer, &msg, pid, regs, 1); err != nil {
+				log.Errorf("unable to handle execveat: %v", err)
 				return
-			}
-			envs, err := tracer.ReadArgStringArray(pid, regs, 2)
-			if err != nil {
-				return
-			}
-
-			msg.Type = proto.SyscallType_Exec
-			msg.PID = uint32(pid)
-			msg.Exec = &proto.ExecSyscallMsg{
-				Filename: filename,
-				Args:     args,
-				Envs:     envs,
 			}
 		default:
 			return
 		}
 
-		ch <- msg
+		msgChan <- msg
 	}
+
+	<-traceChan
 
 	tracer.Trace(cb)
 }
