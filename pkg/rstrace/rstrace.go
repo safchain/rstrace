@@ -3,18 +3,22 @@ package rstrace
 import (
 	"encoding/binary"
 	"os"
-	"os/exec"
 	"runtime"
 	"syscall"
+	"unsafe"
 
 	"github.com/elastic/go-seccomp-bpf"
 	"github.com/elastic/go-seccomp-bpf/arch"
+	"golang.org/x/net/bpf"
+	"golang.org/x/sys/unix"
 )
 
+type CallbackType = int
+
 const (
-	EventFork  = 1
-	EventVFork = 2
-	EventClone = 3
+	CallbackPreType CallbackType = iota
+	CallbackPostType
+	CallbackExitType
 )
 
 type Tracer struct {
@@ -24,8 +28,8 @@ type Tracer struct {
 	info *arch.Info
 }
 
-func waitEvent(status syscall.WaitStatus) uint32 {
-	return (uint32(status) >> 16) & 0xff
+type Opts struct {
+	Syscalls []string
 }
 
 // https://github.com/torvalds/linux/blob/v5.0/arch/x86/entry/entry_64.S#L126
@@ -48,8 +52,8 @@ func (t *Tracer) argToRegValue(regs syscall.PtraceRegs, arg int) uint64 {
 	return 0
 }
 
-func (t *Tracer) ReadRet(regs syscall.PtraceRegs) uint64 {
-	return regs.Rax
+func (t *Tracer) ReadRet(regs syscall.PtraceRegs) int64 {
+	return int64(regs.Rax)
 }
 
 func (t *Tracer) readString(pid int, ptr uint64) (string, error) {
@@ -86,8 +90,12 @@ func (t *Tracer) ReadArgString(pid int, regs syscall.PtraceRegs, arg int) (strin
 	return t.readString(pid, ptr)
 }
 
+func SyscallNr(regs syscall.PtraceRegs) int {
+	return int(regs.Orig_rax)
+}
+
 func (t *Tracer) GetSyscallName(regs syscall.PtraceRegs) string {
-	return t.info.SyscallNumbers[int(regs.Orig_rax)]
+	return t.info.SyscallNumbers[SyscallNr(regs)]
 }
 
 func (t *Tracer) ReadArgStringArray(pid int, regs syscall.PtraceRegs, arg int) ([]string, error) {
@@ -123,12 +131,14 @@ func (t *Tracer) ReadArgStringArray(pid int, regs syscall.PtraceRegs, arg int) (
 	return result, nil
 }
 
-func (t *Tracer) Trace(cb func(pid int, ppid uint32, regs syscall.PtraceRegs)) error {
+func (t *Tracer) Trace(cb func(cbType CallbackType, pid int, ppid uint32, regs syscall.PtraceRegs)) error {
 	var waitStatus syscall.WaitStatus
 
-	if err := syscall.PtraceSyscall(t.PID, 0); err != nil {
+	if err := syscall.PtraceCont(t.PID, 0); err != nil {
 		return err
 	}
+
+	var regs syscall.PtraceRegs
 
 	for {
 		pid, err := syscall.Wait4(-1, &waitStatus, 0, nil)
@@ -140,37 +150,53 @@ func (t *Tracer) Trace(cb func(pid int, ppid uint32, regs syscall.PtraceRegs)) e
 			if pid == t.PID {
 				break
 			}
+			cb(CallbackExitType, pid, 0, regs)
 			continue
 		}
 
-		var regs syscall.PtraceRegs
-
 		if waitStatus.Stopped() {
+			ev := waitStatus >> 16 & 0xff
+
+			name := t.GetSyscallName(regs)
+
 			if err := syscall.PtraceGetRegs(pid, &regs); err != nil {
 				break
 			}
 
-			switch waitEvent(waitStatus) {
-			case EventFork, EventVFork, EventClone:
+			switch ev {
+			case syscall.PTRACE_EVENT_CLONE, syscall.PTRACE_EVENT_FORK, syscall.PTRACE_EVENT_VFORK:
 				if npid, err := syscall.PtraceGetEventMsg(pid); err == nil {
-					cb(int(npid), uint32(pid), regs)
+					cb(CallbackPostType, int(npid), uint32(pid), regs)
+				}
+			case unix.PTRACE_EVENT_SECCOMP:
+				switch name {
+				case "fork", "vfork", "clone":
+					// already handled
+				default:
+					cb(CallbackPreType, pid, 0, regs)
+
+					// force a ptrace syscall in order to get to return value
+					if err := syscall.PtraceSyscall(pid, 0); err != nil {
+						continue
+					}
 				}
 			default:
-				if -regs.Rax == uint64(syscall.ENOSYS) {
-					name := t.GetSyscallName(regs)
-
-					switch name {
-					case "fork", "vfork", "clone":
-						// already handled
-					default:
-						cb(pid, 0, regs)
+				switch name {
+				case "fork", "vfork", "clone":
+					// already handled
+				case "execve", "execveat":
+					// does not return on success, thus ret value stay at syscall.ENOSYS
+					if ret := -t.ReadRet(regs); ret == int64(syscall.ENOSYS) {
+						cb(CallbackPostType, pid, 0, regs)
 					}
-				} else {
-					// exit of syscall
+				default:
+					if ret := -t.ReadRet(regs); ret != int64(syscall.ENOSYS) {
+						cb(CallbackPostType, pid, 0, regs)
+					}
 				}
 			}
 
-			if err := syscall.PtraceSyscall(pid, 0); err != nil {
+			if err := syscall.PtraceCont(pid, 0); err != nil {
 				continue
 			}
 		}
@@ -179,64 +205,166 @@ func (t *Tracer) Trace(cb func(pid int, ppid uint32, regs syscall.PtraceRegs)) e
 	return nil
 }
 
-func NewTracer(name string, args ...string) (*Tracer, error) {
+//go:linkname runtimeBeforeFork syscall.runtime_BeforeFork
+func runtimeBeforeFork()
+
+//go:linkname runtimeAfterFork syscall.runtime_AfterFork
+func runtimeAfterFork()
+
+//go:linkname runtimeAfterForkInChild syscall.runtime_AfterForkInChild
+func runtimeAfterForkInChild()
+
+//go:norace
+func forkExec(argv0 string, argv []string, envv []string, prog *syscall.SockFprog) (int, error) {
+	argv0p, err := syscall.BytePtrFromString(argv0)
+	if err != nil {
+		return 0, err
+	}
+
+	argvp, err := syscall.SlicePtrFromStrings(argv)
+	if err != nil {
+		return 0, err
+	}
+
+	envvp, err := syscall.SlicePtrFromStrings(envv)
+	if err != nil {
+		return 0, err
+	}
+
+	syscall.ForkLock.Lock()
+
+	// no more go runtime calls
+	runtimeBeforeFork()
+
+	pid, _, errno := syscall.RawSyscall6(syscall.SYS_CLONE, uintptr(syscall.SIGCHLD), 0, 0, 0, 0, 0)
+	if errno != 0 || pid != 0 {
+		// back to go runtime
+		runtimeAfterFork()
+
+		syscall.ForkLock.Unlock()
+
+		if errno != 0 {
+			err = errno
+		}
+		return int(pid), err
+	}
+
+	// in the child, no more go runtime calls
+	runtimeAfterForkInChild()
+
+	pid, _, errno = syscall.RawSyscall(syscall.SYS_GETPID, 0, 0, 0)
+	if errno != 0 {
+		exit()
+	}
+
+	_, _, errno = syscall.RawSyscall(syscall.SYS_PTRACE, uintptr(syscall.PTRACE_TRACEME), 0, 0)
+	if errno != 0 {
+		exit()
+	}
+
+	_, _, errno = syscall.RawSyscall6(syscall.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0)
+	if errno != 0 {
+		exit()
+	}
+
+	const (
+		mode  = 1
+		tsync = 1
+	)
+
+	_, _, errno = syscall.RawSyscall(unix.SYS_SECCOMP, mode, tsync, uintptr(unsafe.Pointer(prog)))
+	if errno != 0 {
+		exit()
+	}
+
+	_, _, errno = syscall.RawSyscall(syscall.SYS_KILL, pid, uintptr(syscall.SIGSTOP), 0)
+	if errno != 0 {
+		exit()
+	}
+
+	_, _, err = syscall.RawSyscall(syscall.SYS_EXECVE,
+		uintptr(unsafe.Pointer(argv0p)),
+		uintptr(unsafe.Pointer(&argvp[0])),
+		uintptr(unsafe.Pointer(&envvp[0])))
+
+	return 0, err
+}
+
+func exit() {
+	for {
+		syscall.RawSyscall(syscall.SYS_EXIT, 253, 0, 0)
+	}
+}
+
+func traceFilterProg(opts Opts) (*syscall.SockFprog, error) {
+	policy := seccomp.Policy{
+		DefaultAction: seccomp.ActionAllow,
+		Syscalls: []seccomp.SyscallGroup{
+			{
+				Action: seccomp.ActionTrace,
+				Names:  opts.Syscalls,
+			},
+		},
+	}
+
+	insts, err := policy.Assemble()
+	if err != nil {
+		return nil, err
+	}
+	rawInsts, err := bpf.Assemble(insts)
+	if err != nil {
+		return nil, err
+	}
+
+	filter := make([]syscall.SockFilter, 0, len(rawInsts))
+	for _, instruction := range rawInsts {
+		filter = append(filter, syscall.SockFilter{
+			Code: instruction.Op,
+			Jt:   instruction.Jt,
+			Jf:   instruction.Jf,
+			K:    instruction.K,
+		})
+	}
+	return &syscall.SockFprog{
+		Len:    uint16(len(filter)),
+		Filter: &filter[0],
+	}, nil
+}
+
+func NewTracer(name string, args []string, opts Opts) (*Tracer, error) {
 	info, err := arch.GetInfo("")
+	if err != nil {
+		return nil, err
+	}
+
+	prog, err := traceFilterProg(opts)
 	if err != nil {
 		return nil, err
 	}
 
 	runtime.LockOSThread()
 
-	filter := seccomp.Filter{
-		NoNewPrivs: true,
-		Flag:       seccomp.FilterFlagTSync,
-		Policy: seccomp.Policy{
-			DefaultAction: seccomp.ActionAllow,
-			Syscalls: []seccomp.SyscallGroup{
-				{
-					Action: seccomp.ActionTrace | seccomp.ActionAllow,
-					Names: []string{
-						//"open",
-						//"openat",
-						"fork",
-						"vfork",
-						"clone",
-						"execve",
-						"execveat",
-					},
-				},
-			},
-		},
+	pid, err := forkExec(name, args, os.Environ(), prog)
+	if err != nil {
+		return nil, err
 	}
-	//_ = filter
-
-	if err := seccomp.LoadFilter(filter); err != nil {
+	var wstatus syscall.WaitStatus
+	if _, err = syscall.Wait4(pid, &wstatus, 0, nil); err != nil {
 		return nil, err
 	}
 
-	cmd := exec.Command(os.Args[1], os.Args[2:]...)
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Ptrace: true,
-	}
-
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	cmd.Wait()
-
-	const flags = syscall.PTRACE_O_TRACEVFORK |
+	const flags = 0 |
+		syscall.PTRACE_O_TRACEVFORK |
 		syscall.PTRACE_O_TRACEFORK |
 		syscall.PTRACE_O_TRACECLONE |
 		syscall.PTRACE_O_TRACEEXEC |
-		syscall.PTRACE_O_TRACESYSGOOD
+		syscall.PTRACE_O_TRACESYSGOOD |
+		unix.PTRACE_O_TRACESECCOMP
 
-	syscall.PtraceSetOptions(cmd.Process.Pid, flags)
+	syscall.PtraceSetOptions(pid, flags)
 
 	return &Tracer{
-		PID:  cmd.Process.Pid,
+		PID:  pid,
 		info: info,
 	}, nil
 }

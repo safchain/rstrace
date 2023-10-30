@@ -9,6 +9,7 @@ enum SyscallType {
     Exec = 1;
 	Fork = 2;
 	Open = 3;
+    Exit = 4;
 }
 
 message ContainerContext {
@@ -28,6 +29,8 @@ message ForkSyscallMsg {
     uint32 PPID = 1;
 }
 
+message ExitSyscallMsg {}
+
 message OpenSyscallMsg {
     string Filename = 1;
     uint32 Flags = 2;
@@ -37,10 +40,12 @@ message OpenSyscallMsg {
 message SyscallMsg {
     SyscallType Type = 1;
     uint32 PID = 2;
-    ExecSyscallMsg Exec = 3;
-    OpenSyscallMsg Open = 4;
-    ForkSyscallMsg Fork = 5;
-    ContainerContext ContainerContext = 6;
+    ContainerContext ContainerContext = 3;
+
+    ExecSyscallMsg Exec = 4;
+    OpenSyscallMsg Open = 5;
+    ForkSyscallMsg Fork = 6;
+    ExitSyscallMsg Exit = 7;
 }
 
 message Response {}
