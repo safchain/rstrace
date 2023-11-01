@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/safchain/rstrace/pkg/rstrace"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -21,43 +23,112 @@ var (
 	logLevel string
 )
 
-type PidNr struct {
+type Process struct {
 	Pid int
-	Nr  int
+	Nr  map[int]*proto.SyscallMsg
+	Fd  map[int32]string
 }
 
-func handleOpen(tracer *rstrace.Tracer, msg *proto.SyscallMsg, pid int, regs syscall.PtraceRegs, firstReg int) error {
-	filename, err := tracer.ReadArgString(pid, regs, firstReg)
+func handleOpenAt(tracer *rstrace.Tracer, process *Process, msg *proto.SyscallMsg, regs syscall.PtraceRegs) error {
+	fd := tracer.ReadArgInt32(regs, 0)
+
+	filename, err := tracer.ReadArgString(process.Pid, regs, 1)
 	if err != nil {
 		return err
 	}
+
+	if fd != unix.AT_FDCWD {
+		if path, exists := process.Fd[fd]; exists {
+			filename = filepath.Join(path, filename)
+		}
+	}
+
 	msg.Type = proto.SyscallType_Open
-	msg.PID = uint32(pid)
 	msg.Open = &proto.OpenSyscallMsg{
 		Filename: filename,
-		Flags:    uint32(tracer.ReadArgUint64(regs, firstReg+1)),
-		Mode:     uint32(tracer.ReadArgUint64(regs, firstReg+2)),
+		Flags:    uint32(tracer.ReadArgUint64(regs, 2)),
+		Mode:     uint32(tracer.ReadArgUint64(regs, 3)),
 	}
 
 	return nil
 }
 
-func handleExecve(tracer *rstrace.Tracer, msg *proto.SyscallMsg, pid int, regs syscall.PtraceRegs, firstReg int) error {
-	filename, err := tracer.ReadArgString(pid, regs, firstReg)
+func handleOpen(tracer *rstrace.Tracer, process *Process, msg *proto.SyscallMsg, regs syscall.PtraceRegs) error {
+	filename, err := tracer.ReadArgString(process.Pid, regs, 0)
 	if err != nil {
 		return err
 	}
-	args, err := tracer.ReadArgStringArray(pid, regs, firstReg+1)
+
+	msg.Type = proto.SyscallType_Open
+	msg.Open = &proto.OpenSyscallMsg{
+		Filename: filename,
+		Flags:    uint32(tracer.ReadArgUint64(regs, 1)),
+		Mode:     uint32(tracer.ReadArgUint64(regs, 2)),
+	}
+
+	return nil
+}
+
+func handleExecveAt(tracer *rstrace.Tracer, process *Process, msg *proto.SyscallMsg, regs syscall.PtraceRegs) error {
+	fd := tracer.ReadArgInt32(regs, 0)
+
+	filename, err := tracer.ReadArgString(process.Pid, regs, 1)
 	if err != nil {
 		return err
 	}
-	envs, err := tracer.ReadArgStringArray(pid, regs, firstReg+2)
+
+	if fd != unix.AT_FDCWD {
+		if path, exists := process.Fd[fd]; exists {
+			filename = filepath.Join(path, filename)
+		}
+	}
+
+	args, err := tracer.ReadArgStringArray(process.Pid, regs, 2)
+	if err != nil {
+		return err
+	}
+
+	envs, err := tracer.ReadArgStringArray(process.Pid, regs, 3)
 	if err != nil {
 		return err
 	}
 
 	msg.Type = proto.SyscallType_Exec
-	msg.PID = uint32(pid)
+	msg.Exec = &proto.ExecSyscallMsg{
+		Filename: filename,
+		Args:     args,
+		Envs:     envs,
+	}
+
+	return nil
+}
+
+func handleFcntl(tracer *rstrace.Tracer, process *Process, msg *proto.SyscallMsg, regs syscall.PtraceRegs) error {
+	msg.Type = proto.SyscallType_Fcntl
+	msg.Fcntl = &proto.FcntlSyscallMsg{
+		Fd:  tracer.ReadArgUint32(regs, 0),
+		Cmd: tracer.ReadArgUint32(regs, 1),
+	}
+	return nil
+}
+
+func handleExecve(tracer *rstrace.Tracer, process *Process, msg *proto.SyscallMsg, regs syscall.PtraceRegs) error {
+	filename, err := tracer.ReadArgString(process.Pid, regs, 0)
+	if err != nil {
+		return err
+	}
+
+	args, err := tracer.ReadArgStringArray(process.Pid, regs, 1)
+	if err != nil {
+		return err
+	}
+
+	envs, err := tracer.ReadArgStringArray(process.Pid, regs, 2)
+	if err != nil {
+		return err
+	}
+
+	msg.Type = proto.SyscallType_Exec
 	msg.Exec = &proto.ExecSyscallMsg{
 		Filename: filename,
 		Args:     args,
@@ -106,6 +177,7 @@ func trace(args []string) {
 			"execve",
 			"execveat",
 			"exit",
+			"fcntl",
 		},
 	}
 
@@ -117,7 +189,7 @@ func trace(args []string) {
 	msgChan := make(chan *proto.SyscallMsg, 10000)
 	traceChan := make(chan bool)
 
-	cache, err := lru.New[PidNr, *proto.SyscallMsg](1024)
+	cache, err := lru.New[int, *Process](1024)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -154,6 +226,10 @@ func trace(args []string) {
 	}()
 
 	send := func(msg *proto.SyscallMsg) {
+		if msg == nil {
+			return
+		}
+
 		select {
 		case msgChan <- msg:
 		default:
@@ -162,55 +238,65 @@ func trace(args []string) {
 	}
 
 	cb := func(cbType rstrace.CallbackType, nr int, pid int, ppid int, regs syscall.PtraceRegs) {
-		key := PidNr{
-			Pid: pid,
-			Nr:  nr,
+		process, exists := cache.Get(pid)
+		if !exists {
+			process = &Process{
+				Pid: pid,
+				Nr:  make(map[int]*proto.SyscallMsg),
+				Fd:  make(map[int32]string),
+			}
+
+			cache.Add(pid, process)
 		}
 
 		switch cbType {
 		case rstrace.CallbackPreType:
 			msg := &proto.SyscallMsg{
+				PID:              uint32(pid),
 				ContainerContext: &containerCtx,
 			}
-			cache.Add(key, msg)
+			process.Nr[nr] = msg
 
 			switch nr {
 			case rstrace.OpenNr:
-				if err := handleOpen(tracer, msg, pid, regs, 0); err != nil {
+				if err := handleOpen(tracer, process, msg, regs); err != nil {
 					log.Errorf("unable to handle open: %v", err)
 					return
 				}
 			case rstrace.OpenatNr:
-				if err := handleOpen(tracer, msg, pid, regs, 1); err != nil {
+				if err := handleOpenAt(tracer, process, msg, regs); err != nil {
 					log.Errorf("unable to handle openat: %v", err)
 					return
 				}
 			case rstrace.ExecveNr:
-				if err = handleExecve(tracer, msg, pid, regs, 0); err != nil {
+				if err = handleExecve(tracer, process, msg, regs); err != nil {
 					log.Errorf("unable to handle execve: %v", err)
 					return
 				}
 			case rstrace.ExecveatNr:
-				if err = handleExecve(tracer, msg, pid, regs, 1); err != nil {
+				if err = handleExecveAt(tracer, process, msg, regs); err != nil {
 					log.Errorf("unable to handle execveat: %v", err)
 					return
 				}
+			case rstrace.FcntlNr:
+				_ = handleFcntl(tracer, process, msg, regs)
+
 			}
 		case rstrace.CallbackPostType:
 			switch nr {
 			case rstrace.ExecveNr, rstrace.ExecveatNr:
-				msg, exists := cache.Get(key)
-				if !exists {
-					return
-				}
-				send(msg)
+				send(process.Nr[nr])
 			case rstrace.OpenNr, rstrace.OpenatNr:
-				if tracer.ReadRet(regs) >= 0 {
-					msg, exists := cache.Get(key)
+				if ret := tracer.ReadRet(regs); ret >= 0 {
+					msg, exists := process.Nr[nr]
 					if !exists {
 						return
 					}
-					send(msg)
+
+					send(process.Nr[nr])
+
+					// maintain fd/path mapping
+					process.Fd[int32(ret)] = msg.Open.Filename
 				}
 			case rstrace.ForkNr, rstrace.VforkNr, rstrace.CloneNr:
 				msg := &proto.SyscallMsg{
@@ -222,6 +308,21 @@ func trace(args []string) {
 					PPID: uint32(ppid),
 				}
 				send(msg)
+			case rstrace.FcntlNr:
+				if ret := tracer.ReadRet(regs); ret >= 0 {
+					msg, exists := process.Nr[nr]
+					if !exists {
+						return
+					}
+
+					// maintain fd/path mapping
+					if msg.Fcntl.Cmd == unix.F_DUPFD || msg.Fcntl.Cmd == unix.F_DUPFD_CLOEXEC {
+						if path, exists := process.Fd[int32(msg.Fcntl.Fd)]; exists {
+							process.Fd[int32(ret)] = path
+						}
+					}
+				}
+				// TODO case dup, dup2, dup3, chdir
 			}
 		case rstrace.CallbackExitType:
 			msg := &proto.SyscallMsg{
@@ -230,6 +331,8 @@ func trace(args []string) {
 			msg.Type = proto.SyscallType_Exit
 			msg.PID = uint32(pid)
 			send(msg)
+
+			cache.Remove(pid)
 		}
 	}
 

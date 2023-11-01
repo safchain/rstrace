@@ -116,6 +116,18 @@ func (t *Tracer) ReadArgUint64(regs syscall.PtraceRegs, arg int) uint64 {
 	return t.argToRegValue(regs, arg)
 }
 
+func (t *Tracer) ReadArgInt64(regs syscall.PtraceRegs, arg int) int64 {
+	return int64(t.argToRegValue(regs, arg))
+}
+
+func (t *Tracer) ReadArgInt32(regs syscall.PtraceRegs, arg int) int32 {
+	return int32(t.argToRegValue(regs, arg))
+}
+
+func (t *Tracer) ReadArgUint32(regs syscall.PtraceRegs, arg int) uint32 {
+	return uint32(t.argToRegValue(regs, arg))
+}
+
 func (t *Tracer) ReadArgString(pid int, regs syscall.PtraceRegs, arg int) (string, error) {
 	ptr := t.argToRegValue(regs, arg)
 	return t.readString(pid, ptr)

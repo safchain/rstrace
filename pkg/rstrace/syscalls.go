@@ -10,4 +10,5 @@ const (
 	ForkNr     = 57
 	VforkNr    = 58
 	ExitNr     = 60
+	FcntlNr    = 72
 )

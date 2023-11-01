@@ -10,6 +10,7 @@ enum SyscallType {
 	Fork = 2;
 	Open = 3;
     Exit = 4;
+    Fcntl = 5;
 }
 
 message ContainerContext {
@@ -17,6 +18,11 @@ message ContainerContext {
     string Name = 2;
     string Tag = 3;
     uint64 CreatedAt = 4;
+}
+
+message FcntlSyscallMsg {
+    uint32 Fd = 1;
+    uint32 Cmd = 2;
 }
 
 message ExecSyscallMsg {
@@ -46,6 +52,7 @@ message SyscallMsg {
     OpenSyscallMsg Open = 5;
     ForkSyscallMsg Fork = 6;
     ExitSyscallMsg Exit = 7;
+    FcntlSyscallMsg Fcntl = 8;
 }
 
 message Response {}
