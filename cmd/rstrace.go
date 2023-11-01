@@ -161,10 +161,10 @@ func trace(args []string) {
 		}
 	}
 
-	cb := func(cbType rstrace.CallbackType, pid int, ppid uint32, regs syscall.PtraceRegs) {
+	cb := func(cbType rstrace.CallbackType, nr int, pid int, ppid int, regs syscall.PtraceRegs) {
 		key := PidNr{
 			Pid: pid,
-			Nr:  rstrace.SyscallNr(regs),
+			Nr:  nr,
 		}
 
 		switch cbType {
@@ -174,37 +174,37 @@ func trace(args []string) {
 			}
 			cache.Add(key, msg)
 
-			switch tracer.GetSyscallName(regs) {
-			case "open":
+			switch nr {
+			case rstrace.OpenNr:
 				if err := handleOpen(tracer, msg, pid, regs, 0); err != nil {
 					log.Errorf("unable to handle open: %v", err)
 					return
 				}
-			case "openat":
+			case rstrace.OpenatNr:
 				if err := handleOpen(tracer, msg, pid, regs, 1); err != nil {
 					log.Errorf("unable to handle openat: %v", err)
 					return
 				}
-			case "execve":
+			case rstrace.ExecveNr:
 				if err = handleExecve(tracer, msg, pid, regs, 0); err != nil {
 					log.Errorf("unable to handle execve: %v", err)
 					return
 				}
-			case "execveat":
+			case rstrace.ExecveatNr:
 				if err = handleExecve(tracer, msg, pid, regs, 1); err != nil {
 					log.Errorf("unable to handle execveat: %v", err)
 					return
 				}
 			}
 		case rstrace.CallbackPostType:
-			switch tracer.GetSyscallName(regs) {
-			case "execve", "execveat":
+			switch nr {
+			case rstrace.ExecveNr, rstrace.ExecveatNr:
 				msg, exists := cache.Get(key)
 				if !exists {
 					return
 				}
 				send(msg)
-			case "open", "openat":
+			case rstrace.OpenNr, rstrace.OpenatNr:
 				if tracer.ReadRet(regs) >= 0 {
 					msg, exists := cache.Get(key)
 					if !exists {
@@ -212,14 +212,14 @@ func trace(args []string) {
 					}
 					send(msg)
 				}
-			case "fork", "vfork", "clone":
+			case rstrace.ForkNr, rstrace.VforkNr, rstrace.CloneNr:
 				msg := &proto.SyscallMsg{
 					ContainerContext: &containerCtx,
 				}
 				msg.Type = proto.SyscallType_Fork
 				msg.PID = uint32(pid)
 				msg.Fork = &proto.ForkSyscallMsg{
-					PPID: ppid,
+					PPID: uint32(ppid),
 				}
 				send(msg)
 			}
@@ -231,7 +231,6 @@ func trace(args []string) {
 			msg.PID = uint32(pid)
 			send(msg)
 		}
-
 	}
 
 	<-traceChan
