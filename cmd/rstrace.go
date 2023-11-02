@@ -168,16 +168,16 @@ func trace(args []string) {
 	ctx := context.Background()
 
 	opts := rstrace.Opts{
-		AllowedSyscallNrs: []rstrace.SyscallNr{
-			rstrace.OpenNr,
-			rstrace.OpenatNr,
-			rstrace.ForkNr,
-			rstrace.VforkNr,
-			rstrace.CloneNr,
-			rstrace.ExecveNr,
-			rstrace.ExecveatNr,
-			rstrace.ExitNr,
-			rstrace.FcntlNr,
+		Syscalls: []string{
+			"open",
+			"openat",
+			"fork",
+			"vfork",
+			"clone",
+			"execve",
+			"execveat",
+			"exit",
+			"fcntl",
 		},
 	}
 
@@ -280,6 +280,7 @@ func trace(args []string) {
 				}
 			case rstrace.FcntlNr:
 				_ = handleFcntl(tracer, process, msg, regs)
+
 			}
 		case rstrace.CallbackPostType:
 			switch nr {
@@ -321,7 +322,7 @@ func trace(args []string) {
 						}
 					}
 				}
-				// TODO case dup, dup2, dup3, chdir*/
+				// TODO case dup, dup2, dup3, chdir
 			}
 		case rstrace.CallbackExitType:
 			msg := &proto.SyscallMsg{
