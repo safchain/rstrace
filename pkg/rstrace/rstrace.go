@@ -3,12 +3,12 @@ package rstrace
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"runtime"
 	"syscall"
 	"unsafe"
 
-	"github.com/elastic/go-seccomp-bpf"
 	"github.com/elastic/go-seccomp-bpf/arch"
 	"golang.org/x/net/bpf"
 	"golang.org/x/sys/unix"
@@ -24,15 +24,33 @@ const (
 	MaxStringSize = 4096
 )
 
+type SeccompAction = int
+
+// https://elixir.bootlin.com/linux/latest/source/include/uapi/linux/seccomp.h
+const (
+	SECCOMP_RET_KILL_PROCESS SeccompAction = 0x80000000 /* kill the process */
+	SECCOMP_RET_KILL_THREAD  SeccompAction = 0x00000000 /* kill the thread */
+	SECCOMP_RET_KILL                       = SECCOMP_RET_KILL_THREAD
+	SECCOMP_RET_TRAP         SeccompAction = 0x00030000 /* disallow and force a SIGSYS */
+	SECCOMP_RET_ERRNO        SeccompAction = 0x00050000 /* returns an errno */
+	SECCOMP_RET_USER_NOTIF   SeccompAction = 0x7fc00000 /* notifies userspace */
+	SECCOMP_RET_TRACE        SeccompAction = 0x7ff00000 /* pass to a tracer or disallow */
+	SECCOMP_RET_LOG          SeccompAction = 0x7ffc0000 /* allow after logging */
+	SECCOMP_RET_ALLOW        SeccompAction = 0x7fff0000 /* allow */
+)
+
+const (
+	NrOffset      = 0
+	ArchOffset    = 4
+	InstPtrOffset = 8
+	ArgsOffset    = 16
+)
+
 type Tracer struct {
 	PID int
 
 	// internals
 	info *arch.Info
-}
-
-type Opts struct {
-	Syscalls []string
 }
 
 // https://github.com/torvalds/linux/blob/v5.0/arch/x86/entry/entry_64.S#L126
@@ -133,12 +151,12 @@ func (t *Tracer) ReadArgString(pid int, regs syscall.PtraceRegs, arg int) (strin
 	return t.readString(pid, ptr)
 }
 
-func SyscallNr(regs syscall.PtraceRegs) int {
+func GetSyscallNr(regs syscall.PtraceRegs) int {
 	return int(regs.Orig_rax)
 }
 
 func (t *Tracer) GetSyscallName(regs syscall.PtraceRegs) string {
-	return t.info.SyscallNumbers[SyscallNr(regs)]
+	return t.info.SyscallNumbers[GetSyscallNr(regs)]
 }
 
 func (t *Tracer) ReadArgStringArray(pid int, regs syscall.PtraceRegs, arg int) ([]string, error) {
@@ -201,7 +219,7 @@ func (t *Tracer) Trace(cb func(cbType CallbackType, nr int, pid int, ppid int, r
 				break
 			}
 
-			nr := SyscallNr(regs)
+			nr := GetSyscallNr(regs)
 
 			switch waitStatus >> 16 & 0xff {
 			case syscall.PTRACE_EVENT_CLONE, syscall.PTRACE_EVENT_FORK, syscall.PTRACE_EVENT_VFORK:
@@ -336,38 +354,33 @@ func exit(errno syscall.Errno) {
 	}
 }
 
-func traceFilterProg(opts Opts) (*syscall.SockFprog, error) {
-	policy := seccomp.Policy{
-		DefaultAction: seccomp.ActionAllow,
-		Syscalls: []seccomp.SyscallGroup{
-			{
-				Action: seccomp.ActionTrace,
-				Names:  opts.Syscalls,
-			},
-		},
+func traceFilterProg(info *arch.Info, opts Opts) (*syscall.SockFprog, error) {
+	filter := BPFFilter{
+		AllowedSyscallNrs: opts.AllowedSyscallNrs,
+		CustomBPFInsts:    opts.CustomBPFInsts,
 	}
 
-	insts, err := policy.Assemble()
-	if err != nil {
-		return nil, err
-	}
+	insts := filter.Assemble(info)
+
 	rawInsts, err := bpf.Assemble(insts)
 	if err != nil {
 		return nil, err
 	}
 
-	filter := make([]syscall.SockFilter, 0, len(rawInsts))
-	for _, instruction := range rawInsts {
-		filter = append(filter, syscall.SockFilter{
-			Code: instruction.Op,
-			Jt:   instruction.Jt,
-			Jf:   instruction.Jf,
-			K:    instruction.K,
+	sockFilter := make([]syscall.SockFilter, 0, len(rawInsts))
+	for _, inst := range rawInsts {
+		fmt.Printf("INST: %s\n", inst.Disassemble())
+
+		sockFilter = append(sockFilter, syscall.SockFilter{
+			Code: inst.Op,
+			Jt:   inst.Jt,
+			Jf:   inst.Jf,
+			K:    inst.K,
 		})
 	}
 	return &syscall.SockFprog{
-		Len:    uint16(len(filter)),
-		Filter: &filter[0],
+		Len:    uint16(len(sockFilter)),
+		Filter: &sockFilter[0],
 	}, nil
 }
 
@@ -379,7 +392,7 @@ func NewTracer(path string, args []string, opts Opts) (*Tracer, error) {
 		return nil, err
 	}
 
-	prog, err := traceFilterProg(opts)
+	prog, err := traceFilterProg(info, opts)
 	if err != nil {
 		return nil, err
 	}
