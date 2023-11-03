@@ -6,7 +6,6 @@ import (
 	"os"
 	"runtime"
 	"syscall"
-	"unsafe"
 
 	"github.com/elastic/go-seccomp-bpf"
 	"github.com/elastic/go-seccomp-bpf/arch"
@@ -133,12 +132,12 @@ func (t *Tracer) ReadArgString(pid int, regs syscall.PtraceRegs, arg int) (strin
 	return t.readString(pid, ptr)
 }
 
-func SyscallNr(regs syscall.PtraceRegs) int {
+func GetSyscallNr(regs syscall.PtraceRegs) int {
 	return int(regs.Orig_rax)
 }
 
 func (t *Tracer) GetSyscallName(regs syscall.PtraceRegs) string {
-	return t.info.SyscallNumbers[SyscallNr(regs)]
+	return t.info.SyscallNumbers[GetSyscallNr(regs)]
 }
 
 func (t *Tracer) ReadArgStringArray(pid int, regs syscall.PtraceRegs, arg int) ([]string, error) {
@@ -201,7 +200,7 @@ func (t *Tracer) Trace(cb func(cbType CallbackType, nr int, pid int, ppid int, r
 				break
 			}
 
-			nr := SyscallNr(regs)
+			nr := GetSyscallNr(regs)
 
 			switch waitStatus >> 16 & 0xff {
 			case syscall.PTRACE_EVENT_CLONE, syscall.PTRACE_EVENT_FORK, syscall.PTRACE_EVENT_VFORK:
@@ -244,98 +243,6 @@ func (t *Tracer) Trace(cb func(cbType CallbackType, nr int, pid int, ppid int, r
 
 	return nil
 }
-
-//go:linkname runtimeBeforeFork syscall.runtime_BeforeFork
-func runtimeBeforeFork()
-
-//go:linkname runtimeAfterFork syscall.runtime_AfterFork
-func runtimeAfterFork()
-
-//go:linkname runtimeAfterForkInChild syscall.runtime_AfterForkInChild
-func runtimeAfterForkInChild()
-
-//go:norace
-func forkExec(argv0 string, argv []string, envv []string, prog *syscall.SockFprog) (int, error) {
-	argv0p, err := syscall.BytePtrFromString(argv0)
-	if err != nil {
-		return 0, err
-	}
-
-	argvp, err := syscall.SlicePtrFromStrings(argv)
-	if err != nil {
-		return 0, err
-	}
-
-	envvp, err := syscall.SlicePtrFromStrings(envv)
-	if err != nil {
-		return 0, err
-	}
-
-	syscall.ForkLock.Lock()
-
-	// no more go runtime calls
-	runtimeBeforeFork()
-
-	pid, _, errno := syscall.RawSyscall6(syscall.SYS_CLONE, uintptr(syscall.SIGCHLD), 0, 0, 0, 0, 0)
-	if errno != 0 || pid != 0 {
-		// back to go runtime
-		runtimeAfterFork()
-
-		syscall.ForkLock.Unlock()
-
-		if errno != 0 {
-			err = errno
-		}
-		return int(pid), err
-	}
-
-	// in the child, no more go runtime calls
-	runtimeAfterForkInChild()
-
-	pid, _, errno = syscall.RawSyscall(syscall.SYS_GETPID, 0, 0, 0)
-	if errno != 0 {
-		exit(errno)
-	}
-
-	_, _, errno = syscall.RawSyscall(syscall.SYS_PTRACE, uintptr(syscall.PTRACE_TRACEME), 0, 0)
-	if errno != 0 {
-		exit(errno)
-	}
-
-	_, _, errno = syscall.RawSyscall6(syscall.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0)
-	if errno != 0 {
-		exit(errno)
-	}
-
-	const (
-		mode  = 1
-		tsync = 1
-	)
-
-	_, _, errno = syscall.RawSyscall(unix.SYS_SECCOMP, mode, tsync, uintptr(unsafe.Pointer(prog)))
-	if errno != 0 {
-		exit(errno)
-	}
-
-	_, _, errno = syscall.RawSyscall(syscall.SYS_KILL, pid, uintptr(syscall.SIGSTOP), 0)
-	if errno != 0 {
-		exit(errno)
-	}
-
-	_, _, err = syscall.RawSyscall(syscall.SYS_EXECVE,
-		uintptr(unsafe.Pointer(argv0p)),
-		uintptr(unsafe.Pointer(&argvp[0])),
-		uintptr(unsafe.Pointer(&envvp[0])))
-
-	return 0, err
-}
-
-func exit(errno syscall.Errno) {
-	for {
-		syscall.RawSyscall(syscall.SYS_EXIT, uintptr(errno), 0, 0)
-	}
-}
-
 func traceFilterProg(opts Opts) (*syscall.SockFprog, error) {
 	policy := seccomp.Policy{
 		DefaultAction: seccomp.ActionAllow,
