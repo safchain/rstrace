@@ -196,7 +196,7 @@ func trace(args []string) {
 
 	go func() {
 		if client != nil {
-			msg := <-msgChan
+			msg := &proto.SyscallMsg{}
 			log.Debugf("sending message: %+v", msg)
 
 			_, err := client.SendSyscallMsg(ctx, msg)
