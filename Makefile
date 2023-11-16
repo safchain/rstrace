@@ -3,4 +3,4 @@ all:
 	go build -ldflags="-extldflags=-static" ./cmd/rstrace.go
 
 docker:
-	docker build . -t dd-cws-wrapper
+	docker build . -t safchain/dd-cws-wrapper

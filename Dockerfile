@@ -1,2 +1,2 @@
 FROM alpine
-COPY main /dd-cws-wrapper
+COPY rstrace /dd-cws-wrapper
