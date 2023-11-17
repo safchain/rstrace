@@ -2,8 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io/ioutil"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -138,10 +143,96 @@ func handleExecve(tracer *rstrace.Tracer, process *Process, msg *proto.SyscallMs
 	return nil
 }
 
+type ECSMetadata struct {
+	DockerID   string `json:"DockerId"`
+	DockerName string `json:"DockerName"`
+	Name       string `json:"Name"`
+}
+
+func retrieveECSMetadata(ctx *proto.ContainerContext) error {
+	url := os.Getenv("ECS_CONTAINER_METADATA_URI_V4")
+	if url == "" {
+		return nil
+	}
+	client := http.Client{}
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		return err
+	}
+
+	data := ECSMetadata{}
+	if err = json.Unmarshal(body, &data); err != nil {
+		return err
+	}
+
+	if data.DockerID != "" {
+		ctx.ID = data.DockerID
+	}
+	if data.DockerName != "" {
+		ctx.Name = data.DockerName
+	}
+
+	return nil
+}
+
+func retrieveEnvMetadata(ctx *proto.ContainerContext) {
+	if id := os.Getenv("DD_CONTAINER_ID"); id != "" {
+		ctx.ID = id
+	}
+
+	if name := os.Getenv("DD_CONTAINER_NAME"); name != "" {
+		ctx.Name = name
+	}
+}
+
+func checkEntryPoint(path string) (string, error) {
+	name, err := exec.LookPath(path)
+	if err != nil {
+		return "", err
+	}
+
+	name, err = filepath.Abs(name)
+	if err != nil {
+		return "", err
+	}
+
+	info, err := os.Stat(name)
+	if err != nil {
+		return "", err
+	}
+
+	if !info.Mode().IsRegular() {
+		return "", errors.New("entrypoint not a regular file")
+	}
+
+	if info.Mode()&0111 == 0 {
+		return "", errors.New("entrypoint not an executable")
+	}
+
+	return name, nil
+}
+
 func trace(args []string) {
 	setLogLevel()
 
-	log.Infof("Run %v [%s]\n", args, os.Getenv("DD_CONTAINER_ID"))
+	entry, err := checkEntryPoint(args[0])
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	log.Infof("Run %s %v [%s]\n", entry, args, os.Getenv("DD_CONTAINER_ID"))
 
 	var (
 		client proto.SyscallMsgStreamClient
@@ -158,12 +249,15 @@ func trace(args []string) {
 		client = proto.NewSyscallMsgStreamClient(conn)
 	}
 
-	containerCtx := proto.ContainerContext{
-		ID:        os.Getenv("DD_CONTAINER_ID"),
-		Name:      os.Getenv("DD_CONTAINER_NAME"),
-		Tag:       os.Getenv("DD_CONTAINER_TAG"),
-		CreatedAt: uint64(time.Now().UnixNano()),
+	var containerCtx proto.ContainerContext
+
+	if err := retrieveECSMetadata(&containerCtx); err != nil {
+		log.Fatal(err)
 	}
+
+	retrieveEnvMetadata(&containerCtx)
+
+	containerCtx.CreatedAt = uint64(time.Now().UnixNano())
 
 	ctx := context.Background()
 
@@ -181,7 +275,7 @@ func trace(args []string) {
 		},
 	}
 
-	tracer, err := rstrace.NewTracer(args[0], args, opts)
+	tracer, err := rstrace.NewTracer(entry, args, opts)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -195,6 +289,8 @@ func trace(args []string) {
 	}
 
 	go func() {
+		var seq uint64
+
 		if client != nil {
 			msg := &proto.SyscallMsg{}
 			log.Debugf("sending message: %+v", msg)
@@ -213,15 +309,19 @@ func trace(args []string) {
 					_, err = client.SendSyscallMsg(ctx, msg)
 				}
 			}
+			seq++
 		}
 
 		traceChan <- true
 
 		for msg := range msgChan {
+			msg.SeqNum = seq
+
 			log.Debugf("sending message: %+v", msg)
 			if client != nil {
 				client.SendSyscallMsg(ctx, msg)
 			}
+			seq++
 		}
 	}()
 
@@ -366,7 +466,7 @@ var rootCmd = &cobra.Command{
 }
 
 func main() {
-	rootCmd.Flags().StringVar(&grpcAddr, "grpc", "", "grpc address")
+	rootCmd.Flags().StringVar(&grpcAddr, "grpc", "localhost:5678", "grpc address")
 	rootCmd.Flags().StringVar(&logLevel, "log-level", "info", "log level")
 
 	if err := rootCmd.Execute(); err != nil {
