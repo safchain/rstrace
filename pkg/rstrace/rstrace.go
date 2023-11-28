@@ -21,6 +21,7 @@ const (
 	CallbackExitType
 
 	MaxStringSize = 4096
+	Nsig          = 32
 )
 
 type Tracer struct {
@@ -196,13 +197,23 @@ func (t *Tracer) Trace(cb func(cbType CallbackType, nr int, pid int, ppid int, r
 		}
 
 		if waitStatus.Stopped() {
+			if signal := waitStatus.StopSignal(); signal != syscall.SIGTRAP {
+				if signal < Nsig {
+					_ = syscall.PtraceCont(pid, int(signal))
+
+				} else {
+					_ = syscall.PtraceCont(pid, 0)
+				}
+				continue
+			}
+
 			if err := syscall.PtraceGetRegs(pid, &regs); err != nil {
 				break
 			}
 
 			nr := GetSyscallNr(regs)
 
-			switch waitStatus >> 16 & 0xff {
+			switch waitStatus.TrapCause() {
 			case syscall.PTRACE_EVENT_CLONE, syscall.PTRACE_EVENT_FORK, syscall.PTRACE_EVENT_VFORK:
 				if npid, err := syscall.PtraceGetEventMsg(pid); err == nil {
 					cb(CallbackPostType, nr, int(npid), int(pid), regs)
@@ -279,8 +290,6 @@ func traceFilterProg(opts Opts) (*syscall.SockFprog, error) {
 }
 
 func NewTracer(path string, args []string, opts Opts) (*Tracer, error) {
-	// TODO check path
-
 	info, err := arch.GetInfo("")
 	if err != nil {
 		return nil, err
@@ -297,6 +306,7 @@ func NewTracer(path string, args []string, opts Opts) (*Tracer, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	var wstatus syscall.WaitStatus
 	if _, err = syscall.Wait4(pid, &wstatus, 0, nil); err != nil {
 		return nil, err

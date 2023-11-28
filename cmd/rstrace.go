@@ -438,7 +438,9 @@ func trace(args []string) {
 
 	<-traceChan
 
-	tracer.Trace(cb)
+	if err := tracer.Trace(cb); err != nil {
+		log.Errorf("unable to trace, please check that SYS_PTRACE is applied: %v", err)
+	}
 }
 
 func setLogLevel() {
